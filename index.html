@@ -1,0 +1,512 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+</head>
+<body>
+<title>Procedural Slime Lab</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<style>
+  /* Layout: full-bleed canvas, floating pill controls on top, status toast at the bottom */
+  :root {
+    --bg: #11131a;
+    --fg: #ffffff;
+    --toast-bg: rgba(20, 22, 32, 0.85);
+    --toast-line: rgba(255, 255, 255, 0.15);
+    --spawn: linear-gradient(135deg, #ff4fd8, #7b42f6);
+    --tilt: linear-gradient(135deg, #00c6ff, #0072ff);
+    --reset: linear-gradient(135deg, #ff416c, #ff4b2b);
+    --ui-font: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    color-scheme: dark;
+  }
+  * { box-sizing: border-box; user-select: none; -webkit-user-select: none; -webkit-touch-callout: none; }
+  html, body {
+    margin: 0; padding: 0; width: 100%; height: 100%;
+    overflow: hidden; background: var(--bg); color: var(--fg);
+    font-family: var(--ui-font); touch-action: none;
+  }
+  canvas { display: block; position: fixed; inset: 0; width: 100%; height: 100%; }
+  #hud {
+    position: fixed; top: 0; left: 0; right: 0;
+    padding-top: calc(env(safe-area-inset-top, 0px) + 12px);
+    padding-left: max(16px, env(safe-area-inset-left, 0px));
+    padding-right: max(16px, env(safe-area-inset-right, 0px));
+    display: flex; justify-content: space-between; align-items: center; gap: 10px; flex-wrap: wrap;
+    pointer-events: none; z-index: 10;
+  }
+  .btn {
+    pointer-events: auto; border: none; border-radius: 999px;
+    padding: 12px 18px; font: 700 15px var(--ui-font); color: var(--fg);
+    cursor: pointer; display: flex; align-items: center; gap: 6px;
+    box-shadow: 0 6px 20px rgba(0,0,0,0.35); transition: transform 0.1s ease;
+  }
+  .btn:active { transform: scale(0.93); }
+  .btn:focus-visible { outline: 3px solid var(--fg); outline-offset: 2px; }
+  #spawnBtn { background: var(--spawn); }
+  #motionBtn { background: var(--tilt); }
+  #resetBtn { background: var(--reset); }
+  #toast {
+    position: fixed; left: 50%; bottom: calc(env(safe-area-inset-bottom, 0px) + 16px);
+    transform: translateX(-50%); background: var(--toast-bg);
+    backdrop-filter: blur(10px); -webkit-backdrop-filter: blur(10px);
+    color: var(--fg); padding: 10px 18px; border-radius: 16px; font-size: 13px; line-height: 1.4;
+    border: 1px solid var(--toast-line); pointer-events: none;
+    text-align: center; width: max-content; max-width: calc(100vw - 32px); z-index: 10;
+  }
+  @media (prefers-reduced-motion: reduce) { .btn { transition: none; } }
+</style>
+
+<div id="hud">
+  <button id="spawnBtn" class="btn" type="button">+ New Slime</button>
+  <button id="motionBtn" class="btn" type="button">Enable Tilt</button>
+  <button id="resetBtn" class="btn" type="button">Reset</button>
+</div>
+<div id="toast">Tap "+ New Slime" to mix procedural slimes! Drag to squish, use several fingers to stretch. On a keyboard, arrow keys tilt.</div>
+<canvas id="canvas"></canvas>
+
+<script>
+  const canvas = document.getElementById('canvas');
+  const ctx = canvas.getContext('2d');
+  const toast = document.getElementById('toast');
+  const spawnBtn = document.getElementById('spawnBtn');
+  const resetBtn = document.getElementById('resetBtn');
+  const motionBtn = document.getElementById('motionBtn');
+
+  let width = 0;
+  let height = 0;
+  function resize() {
+    const dpr = Math.min(window.devicePixelRatio || 1, 2);
+    width = canvas.clientWidth || window.innerWidth;
+    height = canvas.clientHeight || window.innerHeight;
+    canvas.width = Math.round(width * dpr);
+    canvas.height = Math.round(height * dpr);
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  }
+  resize();
+  window.addEventListener('resize', resize);
+
+  // Gravity controlled by device tilt, or arrow keys on a keyboard
+  const gravity = { x: 0, y: 0.25 };
+  const activeTouches = new Map();
+  const slimeBatches = [];
+
+  // Web Audio synth for tactile squish feedback
+  let audioCtx = null;
+  function playSquishFeedback(viscosity, textureName) {
+    if (navigator.vibrate) { try { navigator.vibrate(12); } catch (e) {} }
+    try {
+      if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+      if (audioCtx.state === 'suspended') audioCtx.resume();
+      const osc = audioCtx.createOscillator();
+      const gain = audioCtx.createGain();
+      osc.type = textureName === 'Crunchy' ? 'triangle' : 'sine';
+      const baseFreq = 120 + (1 - viscosity) * 220 + Math.random() * 80;
+      osc.frequency.setValueAtTime(baseFreq, audioCtx.currentTime);
+      osc.frequency.exponentialRampToValueAtTime(baseFreq * 1.6, audioCtx.currentTime + 0.06);
+      gain.gain.setValueAtTime(0.04, audioCtx.currentTime);
+      gain.gain.exponentialRampToValueAtTime(0.001, audioCtx.currentTime + 0.065);
+      osc.connect(gain);
+      gain.connect(audioCtx.destination);
+      osc.start();
+      osc.stop(audioCtx.currentTime + 0.07);
+    } catch (e) {}
+  }
+
+  // Procedural Generator
+  const TEXTURES = ['Glossy', 'Fluffy', 'Clear Jelly', 'Crunchy', 'Metallic'];
+  const CHARM_TYPES = ['star', 'heart', 'bead', 'pearl', 'confetti'];
+
+  function randomRange(min, max) {
+    return Math.random() * (max - min) + min;
+  }
+
+  function generateProceduralSlimeDNA() {
+    const baseHue = Math.floor(Math.random() * 360);
+    const fillingHue = (baseHue + Math.floor(randomRange(60, 180))) % 360;
+    const texture = TEXTURES[Math.floor(Math.random() * TEXTURES.length)];
+    const viscosity = Number(randomRange(0.2, 0.92).toFixed(2));
+    const density = Number(randomRange(0.6, 2.2).toFixed(2));
+    const glitterRatio = Number(randomRange(0.15, 0.65).toFixed(2));
+    const charmType = CHARM_TYPES[Math.floor(Math.random() * CHARM_TYPES.length)];
+
+    return {
+      id: Date.now() + Math.random(),
+      baseHue,
+      fillingHue,
+      baseColor: `hsla(${baseHue}, 88%, 58%, ${texture === 'Clear Jelly' ? 0.65 : 0.88})`,
+      innerColor: `hsla(${fillingHue}, 95%, 68%, 0.9)`,
+      highlightColor: `hsla(${baseHue}, 100%, 88%, ${texture === 'Metallic' ? 0.75 : 0.45})`,
+      texture,
+      viscosity,
+      density,
+      glitterRatio,
+      charmType
+    };
+  }
+
+  function spawnSlimeBatch() {
+    const dna = generateProceduralSlimeDNA();
+    const centerX = randomRange(width * 0.25, width * 0.75);
+    const centerY = randomRange(height * 0.25, height * 0.55);
+    const nodes = [];
+    const springs = [];
+    const nodeCount = 34;
+
+    for (let i = 0; i < nodeCount; i++) {
+      const angle = (i / nodeCount) * Math.PI * 2;
+      const ring = i < 12 ? randomRange(8, 28) : randomRange(32, 68);
+      const x = centerX + Math.cos(angle) * ring;
+      const y = centerY + Math.sin(angle) * ring;
+      const isCoreFilling = i < 12;
+
+      nodes.push({
+        x, y,
+        vx: randomRange(-1, 1),
+        vy: randomRange(-1, 1),
+        radius: isCoreFilling ? randomRange(22, 30) : randomRange(26, 36),
+        isCoreFilling,
+        hasGlitter: Math.random() < dna.glitterRatio,
+        glitterPhase: Math.random() * Math.PI * 2,
+        hasCharm: i % 5 === 0,
+        charmAngle: Math.random() * Math.PI * 2
+      });
+    }
+
+    // Connect soft-body springs based on viscosity
+    for (let i = 0; i < nodes.length; i++) {
+      for (let j = i + 1; j < nodes.length; j++) {
+        const dx = nodes[i].x - nodes[j].x;
+        const dy = nodes[i].y - nodes[j].y;
+        const dist = Math.hypot(dx, dy);
+        if (dist < 78) {
+          springs.push({
+            a: i,
+            b: j,
+            restLength: dist,
+            stiffness: 0.015 + dna.viscosity * 0.065
+          });
+        }
+      }
+    }
+
+    slimeBatches.push({ dna, nodes, springs });
+    toast.textContent = `Spawned ${dna.texture} Slime | Viscosity: ${dna.viscosity} | Density: ${dna.density} | Charms: ${dna.charmType.toUpperCase()} (${slimeBatches.length} active)`;
+    playSquishFeedback(dna.viscosity, dna.texture);
+  }
+
+  function resetGame() {
+    slimeBatches.length = 0;
+    toast.textContent = 'All slime cleared! Tap "+ New Slime" to generate a fresh batch.';
+    if (navigator.vibrate) { try { navigator.vibrate([20, 40, 20]); } catch (e) {} }
+  }
+
+  // Draw procedural charms inside slime
+  function drawCharm(ctx, type, x, y, angle) {
+    ctx.save();
+    ctx.translate(x, y);
+    ctx.rotate(angle);
+    if (type === 'star') {
+      ctx.fillStyle = '#fff59d';
+      ctx.beginPath();
+      for (let i = 0; i < 5; i++) {
+        ctx.lineTo(Math.cos((18 + i * 72) * Math.PI / 180) * 8, -Math.sin((18 + i * 72) * Math.PI / 180) * 8);
+        ctx.lineTo(Math.cos((54 + i * 72) * Math.PI / 180) * 3.5, -Math.sin((54 + i * 72) * Math.PI / 180) * 3.5);
+      }
+      ctx.closePath();
+      ctx.fill();
+    } else if (type === 'heart') {
+      ctx.fillStyle = '#ff80ab';
+      ctx.beginPath();
+      ctx.arc(-3, -2, 4, 0, Math.PI * 2);
+      ctx.arc(3, -2, 4, 0, Math.PI * 2);
+      ctx.lineTo(0, 6);
+      ctx.closePath();
+      ctx.fill();
+    } else if (type === 'bead') {
+      ctx.fillStyle = '#80d8ff';
+      ctx.beginPath();
+      ctx.arc(0, 0, 5.5, 0, Math.PI * 2);
+      ctx.fill();
+    } else if (type === 'pearl') {
+      const grad = ctx.createRadialGradient(-2, -2, 1, 0, 0, 6);
+      grad.addColorStop(0, '#ffffff');
+      grad.addColorStop(1, '#d1c4e9');
+      ctx.fillStyle = grad;
+      ctx.beginPath();
+      ctx.arc(0, 0, 6, 0, Math.PI * 2);
+      ctx.fill();
+    } else {
+      ctx.fillStyle = '#69f0ae';
+      ctx.fillRect(-5, -2.5, 10, 5);
+    }
+    ctx.restore();
+  }
+
+  // Physics & Render Loop
+  let time = 0;
+  function animate() {
+    time += 0.04;
+    ctx.clearRect(0, 0, width, height);
+    applyKeyboardTilt();
+
+    for (let bIndex = 0; bIndex < slimeBatches.length; bIndex++) {
+      const batch = slimeBatches[bIndex];
+      const { dna, nodes, springs } = batch;
+      const damping = 0.96 - dna.viscosity * 0.08;
+
+      // Spring constraints
+      for (const s of springs) {
+        const n1 = nodes[s.a];
+        const n2 = nodes[s.b];
+        const dx = n2.x - n1.x;
+        const dy = n2.y - n1.y;
+        const dist = Math.hypot(dx, dy) || 0.001;
+        const maxStretch = s.restLength * (1.8 + (1 - dna.viscosity) * 1.4);
+
+        // Allow tearing/stretching if pulled far apart
+        const effectiveDiff = (Math.min(dist, maxStretch) - s.restLength) / dist;
+        const fx = dx * effectiveDiff * s.stiffness;
+        const fy = dy * effectiveDiff * s.stiffness;
+
+        n1.vx += fx;
+        n1.vy += fy;
+        n2.vx -= fx;
+        n2.vy -= fy;
+      }
+
+      // Update nodes: gravity + multi-finger interaction + walls
+      for (const n of nodes) {
+        n.vx += gravity.x * dna.density * 0.45;
+        n.vy += gravity.y * dna.density * 0.45;
+
+        // Multi-touch interaction
+        activeTouches.forEach((touch) => {
+          const dx = touch.x - n.x;
+          const dy = touch.y - n.y;
+          const dist = Math.hypot(dx, dy);
+          const grabRadius = 90;
+          if (dist < grabRadius) {
+            const influence = (1 - dist / grabRadius);
+            n.vx += (touch.vx * 0.45 + dx * 0.08 * dna.viscosity) * influence;
+            n.vy += (touch.vy * 0.45 + dy * 0.08 * dna.viscosity) * influence;
+            n.charmAngle += 0.05 * influence;
+          }
+        });
+
+        n.vx *= damping;
+        n.vy *= damping;
+        n.x += n.vx;
+        n.y += n.vy;
+
+        // Screen boundaries
+        const pad = n.radius * 0.8;
+        if (n.x < pad) { n.x = pad; n.vx *= -0.4; }
+        if (n.x > width - pad) { n.x = width - pad; n.vx *= -0.4; }
+        if (n.y < pad) { n.y = pad; n.vy *= -0.4; }
+        if (n.y > height - pad) { n.y = height - pad; n.vy *= -0.4; }
+      }
+
+      // 1. Render Outer Slime Membrane
+      ctx.save();
+      ctx.fillStyle = dna.baseColor;
+      for (const n of nodes) {
+        ctx.beginPath();
+        ctx.arc(n.x, n.y, n.radius * 1.25, 0, Math.PI * 2);
+        ctx.fill();
+      }
+
+      // 2. Render Inner Filling Layer
+      ctx.fillStyle = dna.innerColor;
+      for (const n of nodes) {
+        if (n.isCoreFilling) {
+          ctx.beginPath();
+          ctx.arc(n.x, n.y, n.radius * 0.82, 0, Math.PI * 2);
+          ctx.fill();
+        }
+      }
+
+      // 3. Render Texture Highlights
+      ctx.fillStyle = dna.highlightColor;
+      for (const n of nodes) {
+        ctx.beginPath();
+        const offset = dna.texture === 'Fluffy' ? 3 : 7;
+        ctx.arc(n.x - offset, n.y - offset, n.radius * 0.35, 0, Math.PI * 2);
+        ctx.fill();
+      }
+
+      // 4. Render Glitter & Embedded Charms
+      for (const n of nodes) {
+        if (n.hasGlitter) {
+          const alpha = 0.35 + 0.65 * Math.abs(Math.sin(time * 2 + n.glitterPhase));
+          ctx.fillStyle = `rgba(255, 255, 255, ${alpha})`;
+          ctx.beginPath();
+          ctx.arc(n.x + 5, n.y - 4, 2.6, 0, Math.PI * 2);
+          ctx.fill();
+        }
+        if (n.hasCharm) {
+          drawCharm(ctx, dna.charmType, n.x, n.y, n.charmAngle);
+        }
+      }
+      ctx.restore();
+    }
+
+    // Inter-slime collision / buoyancy based on density
+    for (let i = 0; i < slimeBatches.length; i++) {
+      for (let j = i + 1; j < slimeBatches.length; j++) {
+        const b1 = slimeBatches[i];
+        const b2 = slimeBatches[j];
+        for (let a = 0; a < b1.nodes.length; a += 2) {
+          for (let b = 0; b < b2.nodes.length; b += 2) {
+            const n1 = b1.nodes[a];
+            const n2 = b2.nodes[b];
+            const dx = n2.x - n1.x;
+            const dy = n2.y - n1.y;
+            const dist = Math.hypot(dx, dy);
+            const minDist = (n1.radius + n2.radius) * 0.75;
+            if (dist > 0 && dist < minDist) {
+              const overlap = (minDist - dist) * 0.04;
+              const nx = dx / dist;
+              const ny = dy / dist;
+              const massRatio = b1.dna.density / (b1.dna.density + b2.dna.density);
+              n1.vx -= nx * overlap * (1 - massRatio);
+              n1.vy -= ny * overlap * (1 - massRatio);
+              n2.vx += nx * overlap * massRatio;
+              n2.vy += ny * overlap * massRatio;
+            }
+          }
+        }
+      }
+    }
+
+    // A held-still finger stops pushing once it stops moving
+    activeTouches.forEach((touch) => {
+      touch.vx *= 0.6;
+      touch.vy *= 0.6;
+    });
+
+    requestAnimationFrame(animate);
+  }
+
+  function squishOnContact() {
+    if (slimeBatches.length > 0) {
+      const sample = slimeBatches[slimeBatches.length - 1].dna;
+      playSquishFeedback(sample.viscosity, sample.texture);
+    }
+  }
+
+  // Multi-touch handlers
+  canvas.addEventListener('touchstart', (e) => {
+    e.preventDefault();
+    for (const t of e.changedTouches) {
+      activeTouches.set(t.identifier, { x: t.clientX, y: t.clientY, vx: 0, vy: 0 });
+    }
+    squishOnContact();
+  }, { passive: false });
+
+  canvas.addEventListener('touchmove', (e) => {
+    e.preventDefault();
+    for (const t of e.changedTouches) {
+      const prev = activeTouches.get(t.identifier);
+      if (prev) {
+        prev.vx = t.clientX - prev.x;
+        prev.vy = t.clientY - prev.y;
+        prev.x = t.clientX;
+        prev.y = t.clientY;
+      }
+    }
+  }, { passive: false });
+
+  function endTouch(e) {
+    for (const t of e.changedTouches) {
+      activeTouches.delete(t.identifier);
+    }
+  }
+  canvas.addEventListener('touchend', endTouch);
+  canvas.addEventListener('touchcancel', endTouch);
+
+  // Mouse acts as a single finger on desktop
+  canvas.addEventListener('mousedown', (e) => {
+    activeTouches.set('mouse', { x: e.clientX, y: e.clientY, vx: 0, vy: 0 });
+    squishOnContact();
+  });
+  window.addEventListener('mousemove', (e) => {
+    const prev = activeTouches.get('mouse');
+    if (prev) {
+      prev.vx = e.clientX - prev.x;
+      prev.vy = e.clientY - prev.y;
+      prev.x = e.clientX;
+      prev.y = e.clientY;
+    }
+  });
+  window.addEventListener('mouseup', () => activeTouches.delete('mouse'));
+  window.addEventListener('blur', () => activeTouches.delete('mouse'));
+
+  // Arrow keys tilt gravity on a keyboard
+  const keysDown = new Set();
+  window.addEventListener('keydown', (e) => {
+    if (e.key.startsWith('Arrow')) { keysDown.add(e.key); e.preventDefault(); }
+  });
+  window.addEventListener('keyup', (e) => keysDown.delete(e.key));
+  let usingDeviceTilt = false;
+  function applyKeyboardTilt() {
+    if (usingDeviceTilt) return;
+    const tx = (keysDown.has('ArrowRight') ? 1 : 0) - (keysDown.has('ArrowLeft') ? 1 : 0);
+    const ty = (keysDown.has('ArrowDown') ? 1 : 0) - (keysDown.has('ArrowUp') ? 1 : 0);
+    const targetX = tx * 0.45;
+    const targetY = keysDown.size ? ty * 0.45 : 0.25;
+    gravity.x += (targetX - gravity.x) * 0.1;
+    gravity.y += (targetY - gravity.y) * 0.1;
+  }
+
+  // Rotational awareness (iOS 13+ DeviceOrientation API)
+  function handleOrientation(event) {
+    if (event.gamma == null && event.beta == null) return;
+    usingDeviceTilt = true;
+    const gamma = event.gamma || 0; // Left/Right tilt (-90 to 90)
+    const beta = event.beta || 0;   // Front/Back tilt (-180 to 180)
+    gravity.x = Math.max(-1, Math.min(1, gamma / 45)) * 0.45;
+    gravity.y = Math.max(-1, Math.min(1, beta / 45)) * 0.45;
+  }
+
+  function listenForTilt(successText) {
+    window.addEventListener('deviceorientation', handleOrientation);
+    toast.textContent = 'Waiting for tilt data...';
+    setTimeout(() => {
+      if (usingDeviceTilt) {
+        motionBtn.hidden = true;
+        toast.textContent = successText;
+      } else {
+        toast.textContent = 'No tilt sensor data here. Open the page directly in Safari or Chrome on your phone, or use the arrow keys.';
+      }
+    }, 1200);
+  }
+
+  motionBtn.addEventListener('click', async () => {
+    if (typeof DeviceOrientationEvent !== 'undefined' && typeof DeviceOrientationEvent.requestPermission === 'function') {
+      try {
+        const permission = await DeviceOrientationEvent.requestPermission();
+        if (permission === 'granted') {
+          listenForTilt('Tilt gravity enabled! Rotate your phone to slide the slime.');
+        } else {
+          toast.textContent = 'Motion access was declined. Use the arrow keys or drag the slime instead.';
+        }
+      } catch (err) {
+        toast.textContent = 'Motion access needs HTTPS in iOS Safari. Use the arrow keys or drag the slime instead.';
+      }
+    } else {
+      listenForTilt('Tilt gravity active!');
+    }
+  });
+
+  spawnBtn.addEventListener('click', spawnSlimeBatch);
+  resetBtn.addEventListener('click', resetGame);
+
+  // Start with one initial procedural slime
+  spawnSlimeBatch();
+  animate();
+</script>
+</body>
+</html>
